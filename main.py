@@ -1,80 +1,191 @@
-# tiny-chess-01 starter (MIT, see LICENSE): a working entry to start from.
-# It plays every game of the gauntlet through the env at MAKEFUN_ENV_URL:
-# POST /game {} serves the game in play, POST /move {game, move} plays a
-# move, and the loop ends when the env answers status "done".
-#
-# Its chess is one line deep: of the legal moves the env lists, it plays the
-# one that captures the most valuable piece, read from the FEN. Ties go, in
-# order, to the better promotion, the cheaper moving piece, then the first
-# move in UCI order. No clock and no random: the same position always gets
-# the same move, so the trial's replay matches.
-#
-# Make it stronger with a real search under a fixed node or depth budget,
-# never a clock. The rule: this file is the whole engine, at most 4,096
-# bytes as committed, Python 3.13 standard library only.
+import json, os, sys, urllib.request
 
-import json
-import os
-import sys
-import urllib.error
-import urllib.request
-
-ENV_URL = os.environ.get("MAKEFUN_ENV_URL") or sys.exit("MAKEFUN_ENV_URL is not set")
-
-# Piece values by FEN letter, case-insensitive. The king is never captured;
-# its 100 only ranks it last as the moving piece.
-VALUE = {"p": 1, "n": 3, "b": 3, "r": 5, "q": 9, "k": 100}
+U = os.environ["MAKEFUN_ENV_URL"]
 
 
-def post(path, body):
-    """POST a JSON body to the env and return its JSON answer."""
-    req = urllib.request.Request(
-        ENV_URL + path,
-        data=json.dumps(body).encode(),
-        headers={"content-type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req) as res:
-            return json.load(res)
-    except urllib.error.HTTPError as e:
-        sys.exit(f"{path}: HTTP {e.code} {e.read().decode(errors='replace')}")
+def P(p, b):
+    q = urllib.request.Request(U + p, json.dumps(b).encode(), {"content-type": "application/json"})
+    return json.load(urllib.request.urlopen(q))
 
 
-def board_of(fen):
-    """The FEN's pieces as {square: letter}, e.g. {"e1": "K", "e8": "k"}."""
-    board = {}
-    for i, row in enumerate(fen.split()[0].split("/")):
-        file = 0
-        for c in row:
-            if c.isdigit():
-                file += int(c)
-            else:
-                board["abcdefgh"[file] + str(8 - i)] = c
-                file += 1
-    return board
+V = {1: 100, 2: 325, 3: 335, 4: 500, 5: 975, 6: 0}
+G = {2: (-21, -19, -12, -8, 8, 12, 19, 21),
+     3: (-11, -9, 9, 11), 4: (-10, -1, 1, 10),
+     5: (-11, -10, -9, -1, 1, 9, 10, 11), 6: (-11, -10, -9, -1, 1, 9, 10, 11)}
+CAP = int(os.environ.get("CHESS_CAP", 30000))
+N = 0
 
 
-def choose(fen, legal):
-    """The legal UCI move that takes the most, with the fixed tie-break."""
-    board = board_of(fen)
+def fen(s):
+    b = [-9] * 120
+    r = c = 0
+    for ch in s.split()[0]:
+        if ch == "/":
+            r += 1
+            c = 0
+        elif ch.isdigit():
+            c += int(ch)
+        else:
+            v = ".PNBRQK".index(ch.upper())
+            b[21 + r * 10 + c] = v if ch.isupper() else -v
+            c += 1
+    return b
 
-    def rank(move):
-        mover = board[move[:2]].lower()
-        victim = board.get(move[2:4])
-        if victim is None and mover == "p" and move[0] != move[2]:
-            victim = "p"  # en passant: the pawn taken is beside the target
-        taken = VALUE[victim.lower()] if victim else 0
-        promo = VALUE[move[4]] if len(move) == 5 else 0
-        return (-taken, -promo, VALUE[mover], move)
 
-    return min(legal, key=rank)
+def ev(b):
+    t = 0
+    for i in range(21, 99):
+        v = b[i]
+        if not v or v == -9:
+            continue
+        w = abs(v)
+        f = i % 10 - 1
+        r = i // 10 - 2
+        p = V[w]
+        if w == 1:
+            p += (7 - r if v > 0 else r) * 7 - abs(f - 3) * 2
+        elif w == 6:
+            p += 35 - (7 - r if v > 0 else r) * 5
+        else:
+            p += 7 - abs(f - 3) - abs(r - 3)
+        t += p if v > 0 else -p
+    return t
+
+
+def gen(b, s):
+    o = []
+    for i in range(21, 99):
+        v = b[i]
+        if not v or v == -9 or v * s <= 0:
+            continue
+        w = abs(v)
+        if w == 1:
+            j = i - s * 10
+            if b[j] == 0:
+                o.append((i, j))
+            for d in (-11, -9):
+                j = i + s * d
+                if b[j] * s < 0:
+                    o.append((i, j))
+        elif w == 2 or w == 6:
+            for d in G[w]:
+                j = i + d
+                if b[j] != -9 and b[j] * s <= 0:
+                    o.append((i, j))
+        else:
+            for d in G[w]:
+                j = i + d
+                while b[j] == 0:
+                    o.append((i, j))
+                    j += d
+                if b[j] * s < 0:
+                    o.append((i, j))
+    return o
+
+
+def mk(b, m):
+    i, j = m
+    c = b[j]
+    v = b[i]
+    b[i] = 0
+    b[j] = v // abs(v) * 5 if abs(v) == 1 and j // 10 in (2, 9) else v
+    return c
+
+
+def un(b, m, c):
+    i, j = m
+    b[i] = b[j]
+    b[j] = c
+
+
+def qs(b, s, a, be):
+    global N
+    N += 1
+    st = ev(b) * (1 if s > 0 else -1)
+    if st >= be:
+        return st
+    if st > a:
+        a = st
+    ms = [m for m in gen(b, s) if b[m[1]] * s < 0]
+    ms.sort(key=lambda m: -abs(b[m[1]]))
+    for m in ms:
+        c = mk(b, m)
+        if abs(c) == 6:
+            un(b, m, c)
+            return 90000
+        sc = -qs(b, -s, -be, -a)
+        un(b, m, c)
+        if sc > a:
+            a = sc
+            if a >= be:
+                break
+    return a
+
+
+def ab(b, s, d, a, be):
+    global N
+    N += 1
+    if N > CAP:
+        raise OverflowError
+    if d < 1:
+        return qs(b, s, a, be)
+    ms = gen(b, s)
+    ms.sort(key=lambda m: -abs(b[m[1]]))
+    best = -99000
+    for m in ms:
+        c = mk(b, m)
+        if abs(c) == 6:
+            un(b, m, c)
+            return 88000 - d
+        sc = -ab(b, -s, d - 1, -be, -a)
+        un(b, m, c)
+        if sc > best:
+            best = sc
+        if best > a:
+            a = best
+        if a >= be:
+            break
+    if best == -99000:
+        return -88000 + d
+    return best
+
+
+def sq(u):
+    return 21 + (8 - int(u[1])) * 10 + "abcdefgh".index(u[0])
+
+
+def best(g):
+    global N
+    b = fen(g["fen"])
+    s = 1 if g["colour"] == "white" else -1
+    root = [(u, (sq(u[:2]), sq(u[2:4]))) for u in g["legal_moves"]]
+    bw = root[0][0]
+    for d in range(1, 7):
+        N = 0
+        sc = []
+        a = -99000
+        try:
+            for u, m in root:
+                c = mk(b, m)
+                v = -ab(b, -s, d - 1, -99000, -a)
+                un(b, m, c)
+                sc.append((v, u))
+                if v > a:
+                    a = v
+        except OverflowError:
+            break
+        sc.sort(key=lambda x: -x[0])
+        bw = sc[0][1]
+        if sc[0][0] > 80000:
+            break
+    return bw
 
 
 while True:
-    g = post("/game", {})
+    g = P("/game", {})
     if g["status"] == "done":
         break
     while g["status"] == "your_move":
-        g = post("/move", {"game": g["game"], "move": choose(g["fen"], g["legal_moves"])})
-    print(f"game {g['game']}: {g['outcome']} by {g['reason']}", file=sys.stderr)
-print(f"done: {g.get('wins')} won, {g.get('draws')} drawn, {g.get('losses')} lost", file=sys.stderr)
+        g = P("/move", {"game": g["game"], "move": best(g)})
+    print("game %s: %s by %s" % (g["game"], g["outcome"], g["reason"]), file=sys.stderr)
+print("done %s-%s-%s" % (g.get("wins"), g.get("draws"), g.get("losses")), file=sys.stderr)
